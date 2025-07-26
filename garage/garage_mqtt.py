@@ -2,43 +2,53 @@ import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
 import time
 import os
-from dotenv import load_dotenv
 import json
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv("/home/pi/.garage_mqtt.env")
-BROKER = os.getenv("MQTT_BROKER")
+BROKER = os.getenv("MQTT_BROKER", "192.168.x.x")
 PORT = int(os.getenv("MQTT_PORT", 1883))
-USERNAME = os.getenv("MQTT_USERNAME")
-PASSWORD = os.getenv("MQTT_PASSWORD")
+USERNAME = os.getenv("MQTT_USERNAME", "homeassistant")
+PASSWORD = os.getenv("MQTT_PASSWORD", "geheim")
 CLIENT_ID = "garage_pi"
 
-# GPIO pins
-TOR_MITTE_RELAIS = 16
-TOR_RECHTS_RELAIS = 26
-TOR_MITTE_OFFEN = 27
-TOR_MITTE_GESCHLOSSEN = 22
-TOR_RECHTS_OFFEN = 24
-TOR_RECHTS_GESCHLOSSEN = 23
+# GPIO pins configuration
+TOR_CONFIG = {
+    "tor_mitte": {
+        "relay": 16,
+        "open": 27,
+        "closed": 22
+    },
+    "tor_rechts": {
+        "relay": 26,
+        "open": 24,
+        "closed": 23
+    }
+}
 
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
-GPIO.setup([TOR_MITTE_RELAIS, TOR_RECHTS_RELAIS], GPIO.OUT, initial=GPIO.HIGH)
-GPIO.setup([TOR_MITTE_OFFEN, TOR_MITTE_GESCHLOSSEN, TOR_RECHTS_OFFEN, TOR_RECHTS_GESCHLOSSEN],
+GPIO.setup([TOR_CONFIG["tor_mitte"]["relay"], TOR_CONFIG["tor_rechts"]["relay"]],
+           GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup([TOR_CONFIG["tor_mitte"]["open"], TOR_CONFIG["tor_mitte"]["closed"],
+            TOR_CONFIG["tor_rechts"]["open"], TOR_CONFIG["tor_rechts"]["closed"]],
            GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 client = mqtt.Client(client_id=CLIENT_ID)
 client.username_pw_set(USERNAME, PASSWORD)
 client.enable_logger()
 
-last_state_mitte = None
-last_state_rechts = None
+last_states = {
+    "tor_mitte": None,
+    "tor_rechts": None
+}
 
 # Determine current state
-def calc_state(offen_pin, geschlossen_pin, last_state):
-    if GPIO.input(offen_pin) == 0:
+def calc_state(open_pin, closed_pin, last_state):
+    if GPIO.input(open_pin) == 0:
         return "open"
-    elif GPIO.input(geschlossen_pin) == 0:
+    elif GPIO.input(closed_pin) == 0:
         return "closed"
     else:
         if last_state == "open":
@@ -48,121 +58,83 @@ def calc_state(offen_pin, geschlossen_pin, last_state):
         else:
             return "unknown"
 
-def publish_state():
-    global last_state_mitte, last_state_rechts
-
-    mitte = calc_state(TOR_MITTE_OFFEN, TOR_MITTE_GESCHLOSSEN, last_state_mitte)
-    rechts = calc_state(TOR_RECHTS_OFFEN, TOR_RECHTS_GESCHLOSSEN, last_state_rechts)
-
-    if mitte in ["open", "closed"]:
-        last_state_mitte = mitte
-    if rechts in ["open", "closed"]:
-        last_state_rechts = rechts
-
-    client.publish("garage/tor_mitte/state", mitte, retain=True)
-    client.publish("garage/tor_rechts/state", rechts, retain=True)
+def publish_state(force=False):
+    for tor, config in TOR_CONFIG.items():
+        state = calc_state(config["open"], config["closed"], last_states[tor])
+        if state in ["open", "closed"]:
+            last_states[tor] = state
+        # publish only if changed or forced
+        if force or state != last_states.get(tor):
+            print(f"Publish state: {tor} = {state}")
+            client.publish(f"garage/{tor}/state", state, retain=True)
+            last_states[tor] = state
 
 def publish_discovery():
-    discovery_mitte = {
-        "name": "Tor Mitte",
-        "command_topic": "garage/tor_mitte/set",
-        "state_topic": "garage/tor_mitte/state",
-        "payload_open": "open",
-        "payload_close": "close",
-        "state_open": "open",
-        "state_closed": "closed",
-        "state_opening": "opening",
-        "state_closing": "closing",
-        "device_class": "garage",
-        "retain": True,
-        "unique_id": "garage_tor_mitte"
-    }
-
-    discovery_rechts = {
-        "name": "Tor Rechts",
-        "command_topic": "garage/tor_rechts/set",
-        "state_topic": "garage/tor_rechts/state",
-        "payload_open": "open",
-        "payload_close": "close",
-        "state_open": "open",
-        "state_closed": "closed",
-        "state_opening": "opening",
-        "state_closing": "closing",
-        "device_class": "garage",
-        "retain": True,
-        "unique_id": "garage_tor_rechts"
-    }
-
-    client.publish("homeassistant/cover/tor_mitte/config", json.dumps(discovery_mitte), retain=True)
-    client.publish("homeassistant/cover/tor_rechts/config", json.dumps(discovery_rechts), retain=True)
+    for tor in TOR_CONFIG.keys():
+        discovery_payload = {
+            "name": f"{'Tor Mitte' if tor == 'tor_mitte' else 'Tor Rechts'}",
+            "command_topic": f"garage/{tor}/set",
+            "state_topic": f"garage/{tor}/state",
+            "payload_open": "open",
+            "payload_close": "close",
+            "state_open": "open",
+            "state_closed": "closed",
+            "state_opening": "opening",
+            "state_closing": "closing",
+            "device_class": "garage",
+            "unique_id": f"garage_{tor}"
+        }
+        client.publish(f"homeassistant/cover/{tor}/config",
+                       json.dumps(discovery_payload), retain=True)
     print("Home Assistant discovery configuration published")
 
+def toggle_relay(relay_pin):
+    GPIO.output(relay_pin, GPIO.LOW)
+    time.sleep(0.5)
+    GPIO.output(relay_pin, GPIO.HIGH)
+
 def on_message(client, userdata, msg):
-    global last_state_mitte, last_state_rechts
+    # Ignore retained commands for safety
+    if msg.retain:
+        print(f"Ignoring retained command: {msg.topic} -> {msg.payload.decode()}")
+        return
 
     command = msg.payload.decode().lower()
     print(f"Command received: {msg.topic} -> {command}")
 
-    if msg.topic == "garage/tor_mitte/set":
-        current_state = calc_state(TOR_MITTE_OFFEN, TOR_MITTE_GESCHLOSSEN, last_state_mitte)
+    for tor, config in TOR_CONFIG.items():
+        if msg.topic == f"garage/{tor}/set":
+            current_state = calc_state(config["open"], config["closed"], last_states[tor])
 
-        if command == "open" and current_state != "open":
-            print("Opening Tor Mitte")
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.HIGH)
-            client.publish("garage/tor_mitte/state", "opening", retain=True)
+            if command == "open" and current_state != "open":
+                print(f"Opening {tor}")
+                toggle_relay(config["relay"])
+                client.publish(f"garage/{tor}/state", "opening", retain=True)
 
-        elif command == "close" and current_state != "closed":
-            print("Closing Tor Mitte")
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.HIGH)
-            client.publish("garage/tor_mitte/state", "closing", retain=True)
+            elif command == "close" and current_state != "closed":
+                print(f"Closing {tor}")
+                toggle_relay(config["relay"])
+                client.publish(f"garage/{tor}/state", "closing", retain=True)
 
-        elif command == "stop":
-            print("Stopping Tor Mitte")
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_MITTE_RELAIS, GPIO.HIGH)
+            elif command == "stop" and current_state not in ("open", "closed"):
+                print(f"Stopping {tor} (current_state={current_state})")
+                toggle_relay(config["relay"])
 
-        else:
-            print("Command ignored (no change)")
-
-    elif msg.topic == "garage/tor_rechts/set":
-        current_state = calc_state(TOR_RECHTS_OFFEN, TOR_RECHTS_GESCHLOSSEN, last_state_rechts)
-
-        if command == "open" and current_state != "open":
-            print("Opening Tor Rechts")
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.HIGH)
-            client.publish("garage/tor_rechts/state", "opening", retain=True)
-
-        elif command == "close" and current_state != "closed":
-            print("Closing Tor Rechts")
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.HIGH)
-            client.publish("garage/tor_rechts/state", "closing", retain=True)
-
-        elif command == "stop":
-            print("Stopping Tor Rechts")
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.LOW)
-            time.sleep(0.5)
-            GPIO.output(TOR_RECHTS_RELAIS, GPIO.HIGH)
-
-        else:
-            print("Command ignored (no change)")
-
-    publish_state()
+            else:
+                print("Command ignored (no change)")
+    publish_state(force=True)
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("Connected to MQTT broker")
         client.subscribe("garage/+/set")
+
+        # Sync states after restart
+        for tor, config in TOR_CONFIG.items():
+            last_states[tor] = calc_state(config["open"], config["closed"], last_states[tor])
+
         publish_discovery()
-        publish_state()
+        publish_state(force=True)
     else:
         print(f"Connection failed (Code {rc})")
 
@@ -176,7 +148,7 @@ client.loop_start()
 try:
     while True:
         publish_state()
-        time.sleep(1)
+        time.sleep(5)
 except KeyboardInterrupt:
     print("Stopping script...")
 finally:
