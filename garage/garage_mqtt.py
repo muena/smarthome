@@ -51,23 +51,23 @@ def calc_state(open_pin, closed_pin, last_state):
     elif GPIO.input(closed_pin) == 0:
         return "closed"
     else:
-        if last_state == "open":
+        if last_state in ("open", "closing"):
             return "closing"
-        elif last_state == "closed":
+        elif last_state in ("closed", "opening"):
             return "opening"
         else:
             return "unknown"
 
 def publish_state(force=False):
     for tor, config in TOR_CONFIG.items():
-        state = calc_state(config["open"], config["closed"], last_states[tor])
-        if state in ["open", "closed"]:
-            last_states[tor] = state
-        # publish only if changed or forced
-        if force or state != last_states.get(tor):
+        previous_state = last_states.get(tor)
+        state = calc_state(config["open"], config["closed"], previous_state)
+
+        if force or state != previous_state:
             print(f"Publish state: {tor} = {state}")
             client.publish(f"garage/{tor}/state", state, retain=True)
             last_states[tor] = state
+            print(f"Tor {tor} ist {state}")
 
 def publish_discovery():
     for tor in TOR_CONFIG.keys():
@@ -94,7 +94,6 @@ def toggle_relay(relay_pin):
     GPIO.output(relay_pin, GPIO.HIGH)
 
 def on_message(client, userdata, msg):
-    # Ignore retained commands for safety
     if msg.retain:
         print(f"Ignoring retained command: {msg.topic} -> {msg.payload.decode()}")
         return
@@ -129,7 +128,6 @@ def on_connect(client, userdata, flags, rc):
         print("Connected to MQTT broker")
         client.subscribe("garage/+/set")
 
-        # Sync states after restart
         for tor, config in TOR_CONFIG.items():
             last_states[tor] = calc_state(config["open"], config["closed"], last_states[tor])
 
