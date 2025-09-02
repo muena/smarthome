@@ -40,8 +40,8 @@ client.username_pw_set(USERNAME, PASSWORD)
 client.enable_logger()
 
 last_states = {
-    "tor_mitte": None,
-    "tor_rechts": None
+    "tor_mitte": "unknown",
+    "tor_rechts": "unknown"
 }
 
 # Determine current state
@@ -109,11 +109,13 @@ def on_message(client, userdata, msg):
                 print(f"Opening {tor}")
                 toggle_relay(config["relay"])
                 client.publish(f"garage/{tor}/state", "opening", retain=True)
+                last_states[tor] = "opening"  # Temporär setzen, verhindert Zurückspringen auf "closed"
 
             elif command == "close" and current_state != "closed":
                 print(f"Closing {tor}")
                 toggle_relay(config["relay"])
                 client.publish(f"garage/{tor}/state", "closing", retain=True)
+                last_states[tor] = "closing"
 
             elif command == "stop" and current_state not in ("open", "closed"):
                 print(f"Stopping {tor} (current_state={current_state})")
@@ -121,7 +123,7 @@ def on_message(client, userdata, msg):
 
             else:
                 print("Command ignored (no change)")
-    publish_state(force=True)
+    # publish_state(force=True)
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
